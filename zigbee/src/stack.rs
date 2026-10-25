@@ -186,10 +186,42 @@ where
     /// so it can resume where it left off instead of re-commissioning.
     /// [`Self::run`] and [`Self::commission`] do this for you.
     pub async fn resume(&self) -> bool {
-        let resuming = self.device.nlme().resume(self.config.channel()).await;
+        // The configured channel range says where the network *may* be; the
+        // channel it actually uses is not stored anywhere the stack can read
+        // back, so take `channels.start` as a first guess and, if the network is
+        // not on it, look for the network's extended PAN id.
+        //
+        // Without this, changing the coordinator's channel leaves every
+        // rebooted device rejoining on the old channel: the rejoin fails, and
+        // the device then needs a permit-join it should not need.
+        let nib = nib::get_ref();
+        let on_a_network = *nib.network_address() != nib::NWK_UNASSIGNED_ADDRESS;
+        if !on_a_network {
+            return self.device.nlme().resume(self.config.channel()).await;
+        }
+
+        let mut channel = self.config.channel();
+        let channels = self.config.network().channels.clone();
+        // a range of more than one channel means "scan to find it"; a single
+        // channel means the caller already knows
+        if channels.end > channels.start + 1 {
+            let epid = *nib.extended_panid();
+            if let Ok(discovery) = self.device.nlme().network_discovery(channels, 3).await {
+                if let Some(found) = discovery
+                    .network_descriptor
+                    .iter()
+                    .find(|n| n.extended_pan_id.0 == epid)
+                {
+                    channel = found.logical_channel;
+                    log::info!("[APP] network found on channel {channel}");
+                }
+            }
+        }
+
+        let resuming = self.device.nlme().resume(channel).await;
         if resuming {
             log::info!(
-                "[APP] resuming on network: addr={:#06x}",
+                "[APP] resuming on network: addr={:#06x} ch {channel}",
                 *nib::get_ref().network_address()
             );
         }
@@ -246,14 +278,27 @@ where
             Some(confirm) if confirm.status == NlmeJoinStatus::Success => {
                 return Ok(Commissioned::Rejoined(confirm));
             }
-            // on a network but unable to rejoin: the stale address and keys would
-            // make NLME-JOIN refuse to re-associate, so drop them first
+            // On a network but unable to rejoin. Do *not* forget the network:
+            // a rejoin can be refused transiently (the parent is busy, the
+            // coordinator is rebuilding routes, a coordinator that was restarted
+            // answers InvalidRequest once). Forgetting turns a transient refusal
+            // into a device that is off the network until somebody opens a join
+            // window - and since this runs on every boot, every reboot would
+            // strand it. Keep the membership and report the failure so the
+            // caller can retry; the keys and the address are what make the next
+            // attempt possible.
             Some(confirm) => {
+                // Keep the network and hand the failure back to the caller,
+                // which retries: steering from here would reset the Trust Center
+                // link keys and destroy the very membership we are trying to
+                // keep. A rejoin can be refused transiently (a coordinator that
+                // was restarted answers InvalidRequest once), and the stored keys
+                // are what make the next attempt possible.
                 log::warn!(
-                    "[APP] rejoin failed ({:?}), forgetting network",
+                    "[APP] rejoin failed ({:?}); keeping the network (retrying)",
                     confirm.status
                 );
-                device.forget_network();
+                return Ok(Commissioned::Failed(confirm.status));
             }
             // not on a network at all
             None => (),

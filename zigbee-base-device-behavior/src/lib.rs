@@ -179,12 +179,17 @@ impl BaseDeviceBehavior {
             return Ok(None);
         }
 
-        // BDB 7.1 step 4: rejoin on the current channel, so no scan channels.
+        // BDB 7.1 step 4: rejoin. The remembered parent is addressed first, on
+        // the current channel; the scan channels are the fallback for when that
+        // parent no longer answers (a stale neighbor-table entry, a coordinator
+        // that restarted, a network whose channel changed). Without a fallback a
+        // device whose parent is gone cannot rejoin at all and needs a
+        // permit-join - which is what made every reboot strand this device.
         // Read the guard's value out before the `.await` — held across it,
         // it'd deadlock against rejoin_confirm's write of the same NIB field.
         log::debug!("[BDB] step 4: attempt NWK rejoin");
         let extended_panid = *nib.extended_panid();
-        let confirm = device.rejoin(IeeeAddress(extended_panid), 0..0, 0).await?;
+        let confirm = device.rejoin(IeeeAddress(extended_panid), 11..27, 3).await?;
 
         // BDB 7.1 step 5
         if confirm.status == NlmeJoinStatus::Success {
@@ -249,9 +254,22 @@ impl BaseDeviceBehavior {
         }
 
         // BDB 8.2 step 9
+        //
+        // The receive loop is running alongside this and dispatches APS frames
+        // as they arrive; if it got to the Transport-Key first, the key is
+        // already installed and the poll below finds nothing left to fetch -
+        // which is not a failure, and treating it as one aborts commissioning of
+        // an otherwise perfectly joined device.
         log::debug!("[BDB] step 9: poll for network key (transport-key)");
-        device.poll_transport_key().await?;
-        log::debug!("[BDB] step 9: network key installed");
+        match device.poll_transport_key().await {
+            Ok(()) => log::debug!("[BDB] step 9: network key installed"),
+            Err(e) => {
+                if self.nib().security_material_set().is_empty() {
+                    return Err(e);
+                }
+                log::debug!("[BDB] step 9: key already installed by the receive loop ({e:?})");
+            }
+        }
 
         // 3.6.10.2: negotiate the end-device timeout with the parent
         let _ = device.nlme().negotiate_end_device_timeout().await;
