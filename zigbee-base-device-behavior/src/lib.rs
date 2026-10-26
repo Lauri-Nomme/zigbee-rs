@@ -261,15 +261,33 @@ impl BaseDeviceBehavior {
         // which is not a failure, and treating it as one aborts commissioning of
         // an otherwise perfectly joined device.
         log::debug!("[BDB] step 9: poll for network key (transport-key)");
-        match device.poll_transport_key().await {
-            Ok(()) => log::debug!("[BDB] step 9: network key installed"),
-            Err(e) => {
-                if self.nib().security_material_set().is_empty() {
-                    return Err(e);
+        // Retry rather than give up on the first miss: the frame may still be on
+        // its way, and the receive loop may be the one that fetches it - in
+        // either case "the security material has a key" is the condition that
+        // matters, not who fetched it.
+        let mut installed = false;
+        let mut last_error = None;
+        for attempt in 0..20 {
+            if !self.nib().security_material_set().is_empty() {
+                installed = true;
+                break;
+            }
+            match device.poll_transport_key().await {
+                Ok(()) => {
+                    installed = true;
+                    break;
                 }
-                log::debug!("[BDB] step 9: key already installed by the receive loop ({e:?})");
+                Err(e) => last_error = Some(e),
+            }
+            delay.delay_ms(500).await;
+            if attempt == 19 {
+                break;
             }
         }
+        if !installed {
+            return Err(last_error.unwrap_or(NetworkError::NoTransportKey));
+        }
+        log::debug!("[BDB] step 9: network key installed");
 
         // 3.6.10.2: negotiate the end-device timeout with the parent
         let _ = device.nlme().negotiate_end_device_timeout().await;
